@@ -8,6 +8,7 @@ from argparse import ArgumentParser, Namespace
 from enum import Enum
 from glob import glob
 from typing import Dict, Iterable, Optional
+from multiprocessing import Pool
 
 import datasets as hf_datasets
 from streaming import MDSWriter
@@ -32,6 +33,7 @@ def parse_args() -> Namespace:
     parser.add_argument('--path', type=str, required=True)
     parser.add_argument('--out_root', type=str, required=True)
     parser.add_argument('--compression', type=str, default=None)
+    parser.add_argument('--num_proc', type=int, default=1)
 
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
@@ -77,6 +79,7 @@ def build_hf_dataset(
     eos_text: str = '',
     no_wrap: bool = False,
     tokenizer: PreTrainedTokenizerBase = None,
+    num_proc: int = 1
 ) -> IterableDataset:
     """Build an IterableDataset over the HF C4 or pile source data.
 
@@ -102,11 +105,13 @@ def build_hf_dataset(
 
     hf_dataset = hf_datasets.load_dataset('text',
                                           data_files=data_files,
-                                          split=split)
+                                          split=split,
+                                          num_proc=num_proc)
     
     # Remove empty lines
     hf_dataset = hf_dataset.filter(
-        lambda ex: ex['text'] != ''
+        lambda ex: ex['text'] != '',
+        num_proc=num_proc
     )
 
     if mode == ConcatMode.NO_CONCAT:
@@ -128,12 +133,18 @@ def build_hf_dataset(
                 tok_error_msg += 'such as facebook/opt-125m, or specify EOS/BOS text with e.g. '
                 tok_error_msg += '--bos_text=<|endoftext|>.'
                 raise ValueError(tok_error_msg)
-        dataset = ConcatTokensDataset(hf_dataset=hf_dataset,
-                                      tokenizer=tokenizer,
-                                      max_length=max_length,
-                                      bos_text=bos_text,
-                                      eos_text=eos_text,
-                                      no_wrap=no_wrap)
+            
+        dataset = []
+
+        for i in range(num_proc):
+            dataset.append(
+                ConcatTokensDataset(hf_dataset=hf_dataset.shard(num_proc, i),
+                                    tokenizer=tokenizer,
+                                    max_length=max_length,
+                                    bos_text=bos_text,
+                                    eos_text=eos_text,
+                                    no_wrap=no_wrap)
+            )
     return dataset
 
 
@@ -179,16 +190,29 @@ def main(args: Namespace) -> None:
         columns = {'text': 'str'}
 
     # Get samples
-    dataset = build_hf_dataset(path=args.path,
+    datasets = build_hf_dataset(path=args.path,
                                split=args.split,
                                mode=mode,
                                max_length=args.concat_tokens,
                                bos_text=args.bos_text,
                                eos_text=args.eos_text,
                                no_wrap=args.no_wrap,
-                               tokenizer=tokenizer)
+                               tokenizer=tokenizer,
+                               num_proc=args.num_proc)
+    
+    pool_args = []
+    for idx, d in enumerate(datasets):
+        pool_args.append({
+            'id': idx,
+            'dataset': d,
+            'columns': columns,
+            'out_root': args.out_root,
+            'compression': args.compression
+        })
+
 
     print('here')
+    print(len(pool_args))
 
     # Write samples
     print(f'Converting to MDS format...')
@@ -196,12 +220,20 @@ def main(args: Namespace) -> None:
         f'Note that the progress bar is based on the dataset length before tokenization.'
     )
     print(f'It will finish at a value below 100% if tokenizing')
-    with MDSWriter(columns=columns,
-                   out=os.path.join(args.out_root),
-                   compression=args.compression) as out:
-        for sample in tqdm(dataset):
-            out.write(sample)
 
+    with Pool(processes=args.num_proc) as pool:
+        for _ in pool.imap(_store, pool_args):
+            pass
+    
+
+def _store(args: dict):
+    print(args)
+    # print(args['dataset'][0])
+    with MDSWriter(columns=args['columns'],
+                   out=os.path.join(args['out_root'] + '/shard' + str(args['id'])),
+                   compression=args['compression']) as out:
+        for sample in tqdm(args['dataset']):
+            out.write(sample)
 
 if __name__ == '__main__':
     main(parse_args())
